@@ -1,0 +1,9 @@
+{
+    "interval_minutes": 5,
+    "signal_recipient": "номер телефону акаунту",
+    "cli_path": "Шлях до /signal-cli.bat",
+    "group_id": "Треба вписати Group ID",
+    "interval": 1,
+    "area": [
+    ]
+}
