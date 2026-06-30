@@ -41,6 +41,8 @@ except Exception:
     pass
 
 SETTINGS_FILE = "settings.json"
+# Skip automatic update-group runs at this local time (hour, minute).
+UPDATE_GROUP_DISABLED_AT = (12, 0)
 
 # ---------- Logging ----------
 LOG_FILE = "autoscreen.log"
@@ -155,6 +157,11 @@ def update_group():
     signal_recipient = settings.get("signal_recipient")
     group_id = settings.get("group_id")
 
+    now = datetime.now()
+    if (now.hour, now.minute) == UPDATE_GROUP_DISABLED_AT:
+        logger.info("Skipping update_group at configured disabled time %s", UPDATE_GROUP_DISABLED_AT)
+        return
+
     if not cli_path:
         logger.error("Signal CLI path not configured for update_group.")
         return
@@ -262,12 +269,6 @@ class ScreenshotApp(QtWidgets.QMainWindow):
 
         self.last_image_path = None
         self.screenshot_thread = None
-        
-        self.update_timer = QtCore.QTimer()
-        # Run update_group in a background thread to avoid blocking the GUI if signal-cli hangs.
-        self.update_timer.timeout.connect(lambda: threading.Thread(target=update_group, daemon=True).start())
-        self.update_timer.start(30 * 60 * 1000)  # 30 min in milliseconds
-        threading.Thread(target=update_group, daemon=True).start()  # first run immediately
 
         # Run cleanup at startup (non-blocking)
         threading.Thread(target=clean_temp_for_signal, daemon=True).start()
@@ -287,6 +288,10 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         self.select_area_btn = QtWidgets.QPushButton("Обрати область екрана")
         self.select_area_btn.clicked.connect(self.select_area)
         main_layout.addWidget(self.select_area_btn)
+        
+        self.update_group_btn = QtWidgets.QPushButton("Оновити групу Signal")
+        self.update_group_btn.clicked.connect(self.run_update_group)
+        main_layout.addWidget(self.update_group_btn)
 
         interval_widget = QtWidgets.QWidget()
         interval_layout = QtWidgets.QVBoxLayout()
@@ -340,7 +345,7 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         footer_layout.setContentsMargins(5, 5, 5, 5)
         
         # ---------- Version ----------
-        version = "1.0.0.12"
+        version = "1.0.0.13"
         version_label = QtWidgets.QLabel(f"v{version}")
         version_label.setStyleSheet("color: gray; font-size: 9px;")
         footer_layout.addWidget(version_label, alignment=QtCore.Qt.AlignLeft)
@@ -391,6 +396,22 @@ class ScreenshotApp(QtWidgets.QMainWindow):
             self.start_btn.setText("Зупинити")
             QtCore.QTimer.singleShot(10000, self.queue_screenshot_send)
             self.restart_timer()
+
+    def run_update_group(self):
+        self.update_group_btn.setEnabled(False)
+        threading.Thread(target=self._run_update_group_in_background, daemon=True).start()
+
+    def _run_update_group_in_background(self):
+        try:
+            update_group()
+        except Exception:
+            logger.exception("Error while updating Signal group")
+        finally:
+            QtCore.QMetaObject.invokeMethod(self, "enable_update_group_button", QtCore.Qt.QueuedConnection)
+
+    @QtCore.pyqtSlot()
+    def enable_update_group_button(self):
+        self.update_group_btn.setEnabled(True)
 
     def check_and_run_cleanup(self):
         """Check if it's 12:00 and run cleanup if needed"""
