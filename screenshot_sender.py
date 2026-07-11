@@ -14,6 +14,8 @@ import mss
 from PIL import Image
 import logging
 from logging.handlers import RotatingFileHandler
+from signal_security import PendingDevice, SecureSessionManager, SignalDaemonMonitor, approve_pending_device
+from updater import RepositoryUpdater, compare_versions
 
 
 # Try to make the process DPI-aware on Windows so Tk/canvas coordinates
@@ -126,7 +128,7 @@ def send_screenshot(image_path):
 # ---------- Screenshot Capture ----------
 def capture_area(area):
     try:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             # Grab the full virtual screen (monitor 0) and then crop.
             # This is more reliable across complex multi-monitor arrangements
             # (e.g., monitors positioned above/below) where grabbing a large
@@ -256,9 +258,16 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Screenshot Sender")
         self.setWindowIcon(QtGui.QIcon("icon.png"))
-        self.setFixedSize(400, 300)
+        self.setFixedSize(400, 390)
+        self.setMinimumSize(390, 390)
+        self.setMaximumSize(430, 430)
 
         self.settings = load_settings()
+
+        self.security_manager = SecureSessionManager(base_dir=os.getcwd())
+        self.security_manager.initialize()
+        self.pending_devices = []
+        self.updater = RepositoryUpdater(repo_url="https://github.com/LampaMan/SignalScreenshotSender.git", repo_dir=os.getcwd())
 
         self.init_ui()
         self.tray_icon = create_tray_icon(self)
@@ -269,6 +278,9 @@ class ScreenshotApp(QtWidgets.QMainWindow):
 
         self.last_image_path = None
         self.screenshot_thread = None
+        self._load_pending_devices_from_disk()
+        self.daemon_monitor = SignalDaemonMonitor(self.settings, self.security_manager, callback=self.handle_pending_device)
+        self.daemon_monitor.start()
 
         # Run cleanup at startup (non-blocking)
         threading.Thread(target=clean_temp_for_signal, daemon=True).start()
@@ -278,6 +290,12 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         self.cleanup_timer.timeout.connect(self.check_and_run_cleanup)
         self.cleanup_timer.start(60 * 1000)  # Check every minute
         self.last_cleanup_date = None
+
+        self.update_check_timer = QtCore.QTimer()
+        self.update_check_timer.timeout.connect(self.check_for_updates_periodically)
+        self.update_check_timer.start(6 * 60 * 60 * 1000)  # Check every 6 hours
+        self.last_update_notification = None
+        self.pending_update_version = None
         
 
     def init_ui(self):
@@ -285,13 +303,56 @@ class ScreenshotApp(QtWidgets.QMainWindow):
 
         main_layout = QtWidgets.QVBoxLayout()
 
+        self.main_tab = QtWidgets.QWidget()
+        self.security_tab = QtWidgets.QWidget()
+        self.donate_tab = QtWidgets.QWidget()
+
+        self.page_stack = QtWidgets.QStackedWidget()
+        self.page_stack.addWidget(self.main_tab)
+        self.page_stack.addWidget(self.security_tab)
+        self.page_stack.addWidget(self.donate_tab)
+        self.page_stack.currentChanged.connect(lambda _: QtCore.QTimer.singleShot(0, self._update_donate_image))
+
+        self.section_tab_bar = QtWidgets.QTabBar()
+        self.section_tab_bar.addTab("Основне")
+        self.section_tab_bar.addTab("Дозволи пристроїв")
+        self.section_tab_bar.setShape(QtWidgets.QTabBar.RoundedNorth)
+        self.section_tab_bar.setUsesScrollButtons(False)
+        self.section_tab_bar.setExpanding(False)
+        self.section_tab_bar.currentChanged.connect(self.page_stack.setCurrentIndex)
+
+        self.donate_switch_btn = QtWidgets.QPushButton("Дяка")
+        self.donate_switch_btn.setFixedHeight(28)
+        self.donate_switch_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.donate_switch_btn.setStyleSheet(
+            "QPushButton { padding: 4px 10px; border: 1px solid #666; border-radius: 6px; background: #404040; color: white; }"
+            "QPushButton:hover { background: #555; }"
+        )
+        self.donate_switch_btn.clicked.connect(lambda: self.page_stack.setCurrentIndex(2))
+
+        tab_row = QtWidgets.QWidget()
+        tab_row_layout = QtWidgets.QHBoxLayout(tab_row)
+        tab_row_layout.setContentsMargins(0, 0, 0, 0)
+        tab_row_layout.addWidget(self.section_tab_bar)
+        tab_row_layout.addStretch()
+        tab_row_layout.addWidget(self.donate_switch_btn)
+        main_layout.addWidget(tab_row)
+        main_layout.addWidget(self.page_stack)
+
+        main_layout_main = QtWidgets.QVBoxLayout()
+        self.main_tab.setLayout(main_layout_main)
+
         self.select_area_btn = QtWidgets.QPushButton("Обрати область екрана")
         self.select_area_btn.clicked.connect(self.select_area)
-        main_layout.addWidget(self.select_area_btn)
+        main_layout_main.addWidget(self.select_area_btn)
         
         self.update_group_btn = QtWidgets.QPushButton("Оновити групу Signal")
         self.update_group_btn.clicked.connect(self.run_update_group)
-        main_layout.addWidget(self.update_group_btn)
+        main_layout_main.addWidget(self.update_group_btn)
+
+        self.check_update_btn = QtWidgets.QPushButton("Перевірити оновлення")
+        self.check_update_btn.clicked.connect(self.run_update_check)
+        main_layout_main.addWidget(self.check_update_btn)
 
         interval_widget = QtWidgets.QWidget()
         interval_layout = QtWidgets.QVBoxLayout()
@@ -333,11 +394,11 @@ class ScreenshotApp(QtWidgets.QMainWindow):
 
         quick_1.clicked.connect(lambda: self.interval_spin.setValue(1))
         quick_4.clicked.connect(lambda: self.interval_spin.setValue(4))
-        main_layout.addWidget(interval_widget)
+        main_layout_main.addWidget(interval_widget)
 
         self.start_btn = QtWidgets.QPushButton("Почати")
         self.start_btn.clicked.connect(self.toggle_timer)
-        main_layout.addWidget(self.start_btn)
+        main_layout_main.addWidget(self.start_btn)
 
         # Footer with version and author
         footer_widget = QtWidgets.QWidget()
@@ -355,11 +416,85 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         footer_layout.addWidget(author_label, alignment=QtCore.Qt.AlignRight)
         
         footer_widget.setLayout(footer_layout)
-        main_layout.addWidget(footer_widget)
+        main_layout_main.addWidget(footer_widget)
+
+        security_layout = QtWidgets.QVBoxLayout()
+        self.security_tab.setLayout(security_layout)
+        self.security_info = QtWidgets.QLabel("Список очікуваних пристроїв буде тут.\nПрограма працює у фоновому режимі, без мережевих виходів.")
+        self.security_info.setWordWrap(True)
+        security_layout.addWidget(self.security_info)
+        self.security_status = QtWidgets.QLabel(f"Локальний сеанс: {self.security_manager.get_fingerprint()[:16]}")
+        security_layout.addWidget(self.security_status)
+        self.security_list = QtWidgets.QListWidget()
+        security_layout.addWidget(self.security_list)
+
+        donate_layout = QtWidgets.QVBoxLayout()
+        self.donate_tab.setLayout(donate_layout)
+        donate_layout.setContentsMargins(10, 6, 10, 10)
+        donate_title = QtWidgets.QLabel("Підтримай автоматизатора")
+        donate_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        donate_layout.addWidget(donate_title, alignment=QtCore.Qt.AlignCenter)
+        donate_text = QtWidgets.QLabel(
+            "Якщо ця програма рятує тобі час, можна закинути гріш на шаурму автоматизатору рутинної роботи."
+        )
+        donate_text.setWordWrap(True)
+        donate_text.setAlignment(QtCore.Qt.AlignCenter)
+        donate_layout.addWidget(donate_text)
+        donate_layout.addSpacing(6)
+
+        self.donate_image = QtWidgets.QLabel()
+        self.donate_image.setAlignment(QtCore.Qt.AlignCenter)
+        self.donate_image.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.donate_image.setMinimumSize(0, 0)
+
+        image_container = QtWidgets.QWidget()
+        image_container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        image_container_layout = QtWidgets.QVBoxLayout(image_container)
+        image_container_layout.setContentsMargins(0, 0, 0, 0)
+        image_container_layout.addStretch(1)
+        image_container_layout.addWidget(self.donate_image, alignment=QtCore.Qt.AlignCenter)
+        image_container_layout.addStretch(1)
+
+        donate_layout.addWidget(image_container, stretch=1)
+        QtCore.QTimer.singleShot(0, self._update_donate_image)
 
         central = QtWidgets.QWidget()
         central.setLayout(main_layout)
         self.setCentralWidget(central)
+
+    def _update_donate_image(self):
+        donate_path = os.path.join(os.getcwd(), "Donate.png")
+        if not os.path.exists(donate_path) or not hasattr(self, "donate_image"):
+            return
+        pixmap = QtGui.QPixmap(donate_path)
+        if pixmap.isNull():
+            return
+
+        available_size = self.donate_tab.size()
+        if available_size.width() <= 1 or available_size.height() <= 1:
+            available_size = self.size() - QtCore.QSize(80, 160)
+
+        usable_width = max(1, available_size.width() - 70)
+        usable_height = max(1, available_size.height() - 140)
+        target_size = QtCore.QSize(int(usable_width * 0.95), int(usable_height * 0.95))
+
+        scaled_pixmap = pixmap.scaled(
+            target_size,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        self.donate_image.setPixmap(scaled_pixmap)
+        self.donate_image.setFixedSize(scaled_pixmap.size())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "donate_image"):
+            QtCore.QTimer.singleShot(0, self._update_donate_image)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "donate_image"):
+            QtCore.QTimer.singleShot(0, self._update_donate_image)
 
     def enable_dark_theme(self):
         dark_palette = QPalette()
@@ -401,6 +536,14 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         self.update_group_btn.setEnabled(False)
         threading.Thread(target=self._run_update_group_in_background, daemon=True).start()
 
+    def run_update_check(self):
+        self.check_update_btn.setEnabled(False)
+        threading.Thread(target=self._run_update_check_in_background, daemon=True).start()
+
+    def check_for_updates_periodically(self):
+        if self.last_update_notification is None:
+            threading.Thread(target=self._run_update_check_in_background, daemon=True).start()
+
     def _run_update_group_in_background(self):
         try:
             update_group()
@@ -409,9 +552,130 @@ class ScreenshotApp(QtWidgets.QMainWindow):
         finally:
             QtCore.QMetaObject.invokeMethod(self, "enable_update_group_button", QtCore.Qt.QueuedConnection)
 
+    def _run_update_check_in_background(self):
+        try:
+            remote_version = self.updater.fetch_remote_version()
+            local_version = self.updater.current_version()
+            if remote_version and compare_versions(local_version, remote_version) < 0:
+                self.pending_update_version = remote_version
+                self.last_update_notification = remote_version
+                QtCore.QMetaObject.invokeMethod(self, "show_update_available_message", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, remote_version))
+                return
+            if remote_version is None:
+                logger.info("Update check could not resolve remote version")
+        except Exception:
+            logger.exception("Error while checking for updates")
+        finally:
+            QtCore.QMetaObject.invokeMethod(self, "enable_update_buttons", QtCore.Qt.QueuedConnection)
+
+    def install_update(self, remote_version=None):
+        target_version = remote_version or self.pending_update_version
+        if not target_version:
+            return
+        self.check_update_btn.setEnabled(False)
+        self.update_group_btn.setEnabled(False)
+        threading.Thread(target=self._install_update_in_background, args=(target_version,), daemon=True).start()
+
+    def _install_update_in_background(self, target_version):
+        try:
+            result = self.updater.run_self_update(target_version=target_version)
+            if result.get("ok"):
+                QtCore.QMetaObject.invokeMethod(self, "show_update_installed_message", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, result.get("message", "")))
+            else:
+                QtCore.QMetaObject.invokeMethod(self, "show_update_failed_message", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, result.get("error", "")))
+        except Exception:
+            logger.exception("Error while installing update")
+        finally:
+            QtCore.QMetaObject.invokeMethod(self, "enable_update_buttons", QtCore.Qt.QueuedConnection)
+
+    @QtCore.pyqtSlot(str)
+    def show_update_available_message(self, remote_version):
+        reply = QMessageBox.question(
+            self,
+            "Оновлення доступне",
+            f"Доступна нова версія: {remote_version}\nБажаєте встановити її зараз?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.install_update(remote_version)
+
+    @QtCore.pyqtSlot(str)
+    def show_update_installed_message(self, message):
+        QMessageBox.information(self, "Оновлення встановлено", f"Оновлення застосовано: {message}\nПрограма буде перезапущена.")
+        self.restart_application()
+
+    @QtCore.pyqtSlot(str)
+    def show_update_failed_message(self, message):
+        QMessageBox.critical(self, "Помилка оновлення", f"Не вдалося встановити оновлення: {message}")
+
+    def restart_application(self):
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+        except Exception:
+            logger.exception("Failed to restart application")
+        finally:
+            QtWidgets.QApplication.quit()
+
     @QtCore.pyqtSlot()
     def enable_update_group_button(self):
         self.update_group_btn.setEnabled(True)
+
+    @QtCore.pyqtSlot()
+    def enable_update_buttons(self):
+        self.update_group_btn.setEnabled(True)
+        self.check_update_btn.setEnabled(True)
+
+    def _load_pending_devices_from_disk(self):
+        for event in self.security_manager.load_local_events():
+            if event.event_type != "pending_device":
+                continue
+            payload = event.payload
+            device = PendingDevice(
+                uuid=payload.get("uuid", ""),
+                name=payload.get("name", "unknown"),
+                message=payload.get("message", ""),
+                source=payload.get("source", "signal-cli"),
+            )
+            if device.uuid and not any(item.uuid == device.uuid for item in self.pending_devices):
+                self.pending_devices.append(device)
+
+    def handle_pending_device(self, device: PendingDevice):
+        if not any(item.uuid == device.uuid for item in self.pending_devices):
+            self.pending_devices.append(device)
+        QtCore.QMetaObject.invokeMethod(self, "refresh_security_ui", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(object, device))
+        logger.info("Pending device detected: %s (%s)", device.uuid, device.name)
+
+    @QtCore.pyqtSlot(object)
+    def refresh_security_ui(self, device):
+        self._refresh_security_list()
+
+    def _refresh_security_list(self):
+        self.security_list.clear()
+        if not self.pending_devices:
+            self.security_info.setText("Наразі немає нових пристроїв для підтвердження.")
+            return
+        self.security_info.setText(f"Знайдено {len(self.pending_devices)} очікуваних пристроїв.")
+        for device in self.pending_devices:
+            item = QtWidgets.QListWidgetItem(f"{device.name} | {device.uuid}")
+            self.security_list.addItem(item)
+            widget = QtWidgets.QWidget()
+            layout = QtWidgets.QHBoxLayout(widget)
+            label = QtWidgets.QLabel(f"{device.name}\n{device.uuid}")
+            button = QtWidgets.QPushButton("Дозволити")
+            button.clicked.connect(lambda checked=False, dev=device: self.approve_device(dev))
+            layout.addWidget(label)
+            layout.addWidget(button)
+            self.security_list.setItemWidget(item, widget)
+
+    def approve_device(self, device: PendingDevice):
+        try:
+            result = approve_pending_device(device, self.settings, self.security_manager)
+            logger.info("Approved device %s with result: %s", device.uuid, result)
+            self.pending_devices = [item for item in self.pending_devices if item.uuid != device.uuid]
+            self._refresh_security_list()
+        except Exception:
+            logger.exception("Failed to approve device %s", device.uuid)
 
     def check_and_run_cleanup(self):
         """Check if it's 12:00 and run cleanup if needed"""
